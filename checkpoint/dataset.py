@@ -1,18 +1,3 @@
-"""
-dataset.py
-----------
-Streams images from a HuggingFace dataset without downloading the full corpus.
-Returns tensors in [0, 1] range, resized to cfg.image_size.
-
-Usage
------
-    from dataset import build_stream
-
-    for img_tensor in build_stream(cfg, split="train"):
-        # img_tensor: (1, 3, H, W) float32 on CPU
-        ...
-"""
-
 from __future__ import annotations
 
 from typing import Iterator
@@ -24,15 +9,9 @@ from PIL import Image
 
 from config import Config, cfg
 
-
-# ------------------------------------------------------------------ #
-# Internal helpers
-# ------------------------------------------------------------------ #
-
 def _to_tensor(image: Image.Image, size: int) -> torch.Tensor:
     """
     Convert a PIL image to a (1, 3, size, size) float32 tensor in [0, 1].
-    Handles grayscale images by converting to RGB first.
     """
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -52,16 +31,8 @@ def _iter_hf_images(
     image_key: str = "image",
 ) -> Iterator[torch.Tensor]:
     """
-    Infinite generator over a HuggingFace streaming dataset.
-    Cycles through the stream so training can request any number of steps.
-    
-    Parameters
-    ----------
-    split_type : str
-        'train' or 'eval'. Determines which partition of the data to use.
-    split_ratio : float
-        Fraction of data for training (0.8 = 80% train, 20% eval).
-        Uses deterministic modulo-based splitting.
+    Generator over a HuggingFace streaming dataset,
+     so training can request any number of steps.
     """
     split_threshold = int(1.0 / (1.0 - split_ratio)) if split_ratio < 1.0 else 1
     
@@ -74,7 +45,6 @@ def _iter_hf_images(
         )
         idx = 0
         for sample in stream:
-            # Deterministic split: use index modulo
             if split_type == "train":
                 use_sample = (idx % split_threshold) < split_threshold - 1
             else:  # eval
@@ -88,22 +58,15 @@ def _iter_hf_images(
             raw = sample.get(image_key)
 
             if raw is None:
-                # Some datasets store the image under a different key;
-                # try the first value that looks like a PIL Image.
                 for v in sample.values():
                     if isinstance(v, Image.Image):
                         raw = v
                         break
 
             if raw is None:
-                continue  # skip malformed samples
+                continue 
 
             yield _to_tensor(raw, image_size)
-
-
-# ------------------------------------------------------------------ #
-# Public API
-# ------------------------------------------------------------------ #
 
 def build_stream(
     config: Config = cfg,
@@ -112,15 +75,6 @@ def build_stream(
 ) -> Iterator[torch.Tensor]:
     """
     Return an infinite iterator of (1, 3, H, W) image tensors.
-
-    Parameters
-    ----------
-    config : Config
-        Project configuration instance.
-    split : str, optional
-        Override config.hf_split (HuggingFace split name).
-    split_type : str
-        'train' or 'eval'. For manual train/eval split of the data.
     """
     return _iter_hf_images(
         dataset_name=config.hf_dataset_name,

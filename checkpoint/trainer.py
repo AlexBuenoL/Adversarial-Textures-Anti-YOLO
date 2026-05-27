@@ -1,18 +1,3 @@
-"""
-trainer.py
-----------
-Adversarial training loop.
-
-Flow per step
--------------
-1.  Pull one image from the HuggingFace stream.
-2.  Forward pass through the perturbation UNet  →  (adv_image, perturbation).
-3.  Resize adv_image to 640×640 and run YOLO forward (no grad, frozen).
-4.  Compute AdversarialLoss.
-5.  Back-prop through resize + UNet only.
-6.  Log, checkpoint, and save sample visualisations periodically.
-"""
-
 from __future__ import annotations
 
 import itertools
@@ -30,16 +15,11 @@ from dataset import build_stream
 from losses import AdversarialLoss, preprocess_for_yolo
 from model import PerturbationUNet, build_perturbation_net
 
-
-# ------------------------------------------------------------------ #
-# Helpers
-# ------------------------------------------------------------------ #
+# -- helpers --
 
 def _load_yolo_backbone(weights: str, device: torch.device) -> torch.nn.Module:
     """
-    Load YOLOv8, extract the underlying nn.Module, freeze all parameters,
-    and set it to eval mode.  Returns the raw model (not the YOLO wrapper)
-    so we can get differentiable raw tensor outputs.
+    Load YOLOv8, freeze all parameters, and set it to eval mode.
     """
     yolo = YOLO(weights)
     model = yolo.model.to(device)
@@ -51,7 +31,6 @@ def _load_yolo_backbone(weights: str, device: torch.device) -> torch.nn.Module:
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[trainer] YOLO backbone loaded | params: {total_params:,} (frozen)")
     return model
-
 
 def _save_checkpoint(
     net: PerturbationUNet,
@@ -72,7 +51,6 @@ def _save_checkpoint(
     )
     print(f"[trainer] Checkpoint saved → {path}")
 
-
 def _max_person_confidence(results) -> float:
     """Extract maximum person (class 0) confidence from YOLO results."""
     if results.boxes is None or len(results.boxes) == 0:
@@ -84,12 +62,10 @@ def _max_person_confidence(results) -> float:
     
     return float(person_boxes.conf.max().item())
 
-
 def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     """Convert (3, H, W) torch tensor [0,1] to PIL Image."""
     img_np = (tensor.cpu().detach().permute(1, 2, 0).numpy() * 255).astype('uint8')
     return Image.fromarray(img_np)
-
 
 def _draw_prediction_text(
     pil_img: Image.Image, 
@@ -98,37 +74,27 @@ def _draw_prediction_text(
 ) -> Image.Image:
     """
     Draw YOLO prediction text on image.
-    
-    Parameters
-    ----------
-    pil_img : PIL Image
-        Image to draw on
-    confidence : float
-        Person detection confidence (0-1)
-    position : str
-        'top' or 'bottom' for text placement
     """
     draw = ImageDraw.Draw(pil_img)
     text = f"Conf: {confidence:.3f}"
     
-    # Use default font (small)
     try:
         font = ImageFont.truetype("arial.ttf", size=16)
     except (OSError, IOError):
         font = ImageFont.load_default()
     
-    # Get text bounding box
+    # get text bounding box
     bbox = draw.textbbox((0, 0), text, font=font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
     
-    # Position text
+    # position text
     if position == "top":
         x, y = 5, 5
     else:
         x, y = 5, pil_img.height - text_height - 5
     
-    # Draw background rectangle (semi-transparent look using black)
+    # draw background rectangle
     padding = 2
     draw.rectangle(
         [(x - padding, y - padding), 
@@ -136,11 +102,10 @@ def _draw_prediction_text(
         fill=(0, 0, 0)
     )
     
-    # Draw text
+    # draw text
     draw.text((x, y), text, fill=(255, 255, 255), font=font)
     
     return pil_img
-
 
 def _save_samples(
     net: PerturbationUNet,
@@ -162,7 +127,7 @@ def _save_samples(
         for img in sample_images:
             adv, perturb = net(img)
             
-            # Convert to numpy for YOLO (move to CPU if on GPU)
+            # convert to numpy for YOLO
             def to_numpy(t):
                 return (
                     t.squeeze(0)
@@ -176,28 +141,28 @@ def _save_samples(
             orig_np = to_numpy(img)
             adv_np = to_numpy(adv)
             
-            # Get YOLO predictions
+            # get YOLO predictions
             orig_results = yolo(orig_np, verbose=False)
             adv_results = yolo(adv_np, verbose=False)
             
             orig_conf = _max_person_confidence(orig_results[0])
             adv_conf = _max_person_confidence(adv_results[0])
             
-            # Convert to PIL and add prediction text
+            # convert to PIL and add prediction text
             orig_pil = _tensor_to_pil(img[0])
             adv_pil = _tensor_to_pil(adv[0])
             
             orig_pil = _draw_prediction_text(orig_pil, orig_conf, position="top")
             adv_pil = _draw_prediction_text(adv_pil, adv_conf, position="top")
             
-            # Convert back to tensors
+            # convert back to tensors
             orig_tensor = TF.to_tensor(orig_pil)
             adv_tensor = TF.to_tensor(adv_pil)
             
-            # Normalise perturbation to [0,1] for visibility
+            # normalize perturbation to [0,1] for visibility
             p = perturb[0]  # [3, 256, 256]
             
-            # Normalize each channel independently for better visualization
+            # normalize each channel independently
             p_vis = torch.zeros_like(p)
             for c in range(p.shape[0]):
                 p_c = p[c]
@@ -209,25 +174,16 @@ def _save_samples(
     grid = vutils.make_grid(grid_images, nrow=3, padding=2, normalize=False)
     path = sample_dir / f"sample_s{step:06d}.png"
     vutils.save_image(grid, path)
-    print(f"[trainer] Sample grid saved   → {path}")
+    print(f"[trainer] Sample grid saved -> {path}")
 
     net.train()
 
 
-# ------------------------------------------------------------------ #
-# Trainer
-# ------------------------------------------------------------------ #
+# -- trainer --
 
 class Trainer:
     """
-    Encapsulates everything needed for one training run.
-
-    Parameters
-    ----------
-    config : Config
-        Hyperparameters and paths.
-    resume_from : str | Path | None
-        Path to a .pt checkpoint file to resume from.
+    Encapsulates everything for a training run.
     """
 
     def __init__(
@@ -238,31 +194,28 @@ class Trainer:
         self.cfg = config
         self.device = torch.device(config.device)
 
-        # ---- Models -------------------------------------------------- #
+        # models
         self.net = build_perturbation_net(config).to(self.device)
         self.yolo = _load_yolo_backbone(config.yolo_weights, self.device)
         self.yolo_wrapper = YOLO(config.yolo_weights)  # For inference & visualization
 
-        # ---- Optimiser ----------------------------------------------- #
+        # optimizer
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
 
-        # ---- Loss ---------------------------------------------------- #
+        # loss
         self.criterion = AdversarialLoss(config)
 
-        # ---- State --------------------------------------------------- #
+        # state
         self.start_epoch = 0
         self.global_step = 0
 
         if resume_from is not None:
             self._load_checkpoint(Path(resume_from))
 
-        # ---- Data ---------------------------------------------------- #
-        # Use 80% training partition only
+        # data (80% training)
         self.stream = build_stream(config, split_type="train")
 
-        # Cache a fixed set of images for reproducible sample grids.
-        # Filter to only include images where YOLO detects a person.
-        # We pull them once at init so they stay consistent across epochs.
+        # cache a fixed set of images for reproducible sample grids (persons)
         print(f"[trainer] Caching {config.num_sample_images} sample images with person detections…")
         self.sample_images: list[torch.Tensor] = []
         
@@ -272,7 +225,7 @@ class Trainer:
         while len(self.sample_images) < config.num_sample_images and attempts < max_attempts:
             img = next(self.stream).to(self.device)
             
-            # Check if YOLO detects a person
+            # check if YOLO detects a person
             def to_numpy(t):
                 return (
                     t.squeeze(0)
@@ -294,53 +247,42 @@ class Trainer:
         if len(self.sample_images) < config.num_sample_images:
             print(f"[trainer] WARNING: Only found {len(self.sample_images)}/{config.num_sample_images} images with person detections after {attempts} attempts")
 
-    # ------------------------------------------------------------------ #
-
     def _load_checkpoint(self, path: Path) -> None:
         ckpt = torch.load(path, map_location=self.device)
         self.net.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.start_epoch = ckpt["epoch"]
         self.global_step = ckpt["step"]
-        print(f"[trainer] Resumed from {path} (epoch {self.start_epoch}, step {self.global_step})")
-
-    # ------------------------------------------------------------------ #
+        print(f"[trainer] Taken from {path} (epoch {self.start_epoch}, step {self.global_step})")
 
     def _train_step(self, orig_image: torch.Tensor) -> dict[str, float]:
         """
-        Single optimisation step.
-
-        Returns the loss breakdown dict for logging.
+        Single optimization step.
         """
         orig_image = orig_image.to(self.device)
 
         self.optimizer.zero_grad()
 
-        # 1. Generate adversarial image
+        # 1: generate adversarial image
         adv_image, perturbation = self.net(orig_image)
 
-        # 2. Resize to YOLO input resolution (differentiable)
+        # 2: resize to YOLO input resolution (differentiable)
         adv_yolo = preprocess_for_yolo(adv_image, self.cfg.yolo_input_size)
 
-        # 3. YOLO forward pass (frozen — gradients flow through resize only)
+        # 3: YOLO forward pass (frozen -> gradients flow)
         with torch.no_grad():
-            # We need grads through the input, not the YOLO parameters.
-            # Re-enable grad on the tensor itself after the no_grad context
-            pass  # see below
+            pass
 
         # YOLO raw output: (1, 84, 8400)
-        # We call model() directly to get the raw tensor before NMS.
-        # torch.no_grad() on YOLO params is already handled by requires_grad=False,
-        # so gradients do flow back through adv_yolo into the UNet.
         raw_output = self.yolo(adv_yolo)
 
-        # ultralytics returns a tuple; index 0 is the raw prediction tensor
+        # index 0 is the raw prediction tensor
         if isinstance(raw_output, (tuple, list)):
             raw_tensor = raw_output[0]
         else:
             raw_tensor = raw_output
 
-        # 4. Compute loss
+        # 4: compute loss
         total_loss, breakdown = self.criterion(
             raw_yolo_output=raw_tensor,
             adv_image=adv_image,
@@ -348,16 +290,14 @@ class Trainer:
             perturbation=perturbation,
         )
 
-        # 5. Back-prop
+        # 5: loss backpropagation
         total_loss.backward()
         self.optimizer.step()
 
         return breakdown
 
-    # ------------------------------------------------------------------ #
-
     def train(self) -> None:
-        """Run the full training schedule defined in config."""
+        """Run the full training."""
         print(
             f"\n[trainer] Starting training | "
             f"epochs={self.cfg.epochs} | "
@@ -380,7 +320,7 @@ class Trainer:
                 for k in running:
                     running[k] += breakdown[k]
 
-                # Logging
+                # logging
                 if self.global_step % self.cfg.log_every == 0:
                     avg = {k: running[k] / count for k in running}
                     lambda_info = ""
@@ -394,11 +334,11 @@ class Trainer:
                         f"recon={avg['recon']:.6f} "
                         f"tv={avg['tv']:.6f}){lambda_info}"
                     )
-                    # Reset running stats after each log
+                    # reset running stats after each log
                     running = {k: 0.0 for k in running}
                     count   = 0
 
-                # Checkpoint
+                # checkpoint
                 if self.global_step % self.cfg.save_every == 0:
                     _save_checkpoint(
                         self.net,
@@ -408,7 +348,7 @@ class Trainer:
                         self.cfg.checkpoint_dir,
                     )
 
-                # Sample grid
+                # sample grid
                 if self.global_step % self.cfg.sample_every == 0:
                     _save_samples(
                         self.net,
@@ -418,7 +358,7 @@ class Trainer:
                         self.cfg.sample_dir,
                     )
 
-        # Final checkpoint at end of training
+        # final checkpoint at end of training
         _save_checkpoint(
             self.net,
             self.optimizer,

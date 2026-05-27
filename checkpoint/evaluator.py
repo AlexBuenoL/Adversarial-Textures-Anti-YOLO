@@ -1,33 +1,3 @@
-"""
-evaluator.py
-------------
-Measures how well the trained perturbation network fools YOLOv8.
-
-Metrics reported
-----------------
-- Detection suppression rate:
-    % of images where YOLO finds zero person detections after perturbation
-    (vs. the original image which must have at least one detection).
-
-- Mean confidence drop:
-    Average reduction in the maximum person-class confidence score.
-
-- Mean PSNR (Peak Signal-to-Noise Ratio):
-    Perceptual quality of the adversarial image vs. the original.
-    Higher = less visible perturbation.  >35 dB is considered imperceptible.
-
-- Mean SSIM (Structural Similarity Index):
-    Structural fidelity.  Values close to 1.0 mean visually identical.
-
-Usage
------
-    from evaluator import Evaluator
-    from config import cfg
-
-    ev = Evaluator(cfg, checkpoint_path="outputs/checkpoints/ckpt_ep005_s002500.pt")
-    ev.run()
-"""
-
 from __future__ import annotations
 
 import math
@@ -40,20 +10,17 @@ from ultralytics import YOLO
 
 from config import Config, cfg
 from dataset import build_stream
-from model import PerturbationUNet, build_perturbation_net
+from model import build_perturbation_net
 
 
-# ------------------------------------------------------------------ #
-# Perceptual quality helpers
-# ------------------------------------------------------------------ #
+# -- perceptual quality helpers --
 
 def psnr(original: torch.Tensor, adversarial: torch.Tensor) -> float:
-    """Peak Signal-to-Noise Ratio in dB (higher = less distortion)."""
+    """Peak signal-to-Noise ratio in dB (higher = less distortion)."""
     mse = F.mse_loss(adversarial, original).item()
     if mse == 0:
         return float("inf")
     return 10 * math.log10(1.0 / mse)
-
 
 def ssim(
     original: torch.Tensor,
@@ -64,28 +31,26 @@ def ssim(
 ) -> float:
     """
     Simplified single-scale SSIM (averaged over channels).
-    Returns a value in [-1, 1]; values close to 1 = nearly identical.
+    Returns a value in [-1, 1]; values close to 1 = almost identical.
     """
-    mu1 = F.avg_pool2d(original,     window_size, stride=1, padding=window_size // 2)
-    mu2 = F.avg_pool2d(adversarial,   window_size, stride=1, padding=window_size // 2)
+    mu1 = F.avg_pool2d(original, window_size, stride=1, padding=window_size // 2)
+    mu2 = F.avg_pool2d(adversarial, window_size, stride=1, padding=window_size // 2)
 
     mu1_sq = mu1 ** 2
     mu2_sq = mu2 ** 2
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = F.avg_pool2d(original ** 2,              window_size, 1, window_size // 2) - mu1_sq
-    sigma2_sq = F.avg_pool2d(adversarial ** 2,            window_size, 1, window_size // 2) - mu2_sq
-    sigma12   = F.avg_pool2d(original * adversarial,      window_size, 1, window_size // 2) - mu1_mu2
+    sigma1_sq = F.avg_pool2d(original ** 2, window_size, 1, window_size // 2) - mu1_sq
+    sigma2_sq = F.avg_pool2d(adversarial ** 2, window_size, 1, window_size // 2) - mu2_sq
+    sigma12 = F.avg_pool2d(original * adversarial, window_size, 1, window_size // 2) - mu1_mu2
 
-    numerator   = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+    numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
     denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
 
     return (numerator / (denominator + 1e-8)).mean().item()
 
 
-# ------------------------------------------------------------------ #
-# YOLO helpers
-# ------------------------------------------------------------------ #
+# -- YOLO helpers --
 
 def _max_person_confidence(result) -> float:
     """
@@ -103,27 +68,16 @@ def _max_person_confidence(result) -> float:
     ]
     return max(person_confs) if person_confs else 0.0
 
-
 def _has_person_detection(result) -> bool:
     return _max_person_confidence(result) > 0.0
 
 
-# ------------------------------------------------------------------ #
-# Evaluator
-# ------------------------------------------------------------------ #
+# -- evaluator --
 
 class Evaluator:
     """
     Load a trained perturbation network and evaluate it against YOLO.
-
-    Parameters
-    ----------
-    config : Config
-    checkpoint_path : str | Path | None
-        Path to a saved .pt checkpoint.  If None, uses a randomly
-        initialised network (useful as a sanity-check baseline).
     """
-
     def __init__(
         self,
         config: Config = cfg,
@@ -132,7 +86,7 @@ class Evaluator:
         self.cfg    = config
         self.device = torch.device(config.device)
 
-        # Perturbation network
+        # perturbation network
         self.net = build_perturbation_net(config).to(self.device)
 
         if checkpoint_path is not None:
@@ -140,28 +94,27 @@ class Evaluator:
             self.net.load_state_dict(ckpt["model_state_dict"])
             print(f"[evaluator] Loaded checkpoint: {checkpoint_path}")
         else:
-            print("[evaluator] No checkpoint provided — using random weights.")
+            print("[evaluator] No checkpoint provided --> using random weights.")
 
         self.net.eval()
 
-        # YOLO (high-level wrapper for easy result parsing)
+        # YOLO (wrapper for easy result parsing)
         self.yolo = YOLO(config.yolo_weights)
 
-        # Data stream — use eval split (20% of data by default)
+        # data stream --> use eval split
         self.stream = build_stream(config, split_type="eval")
-
-    # ------------------------------------------------------------------ #
 
     @torch.no_grad()
     def _evaluate_single(
         self, orig_tensor: torch.Tensor
     ) -> dict:
         """
-        Evaluate one image.  Returns a dict of per-image metrics.
+        Evaluate one image.  
+        Returns a dict of metrics per image.
         """
         adv_tensor, _ = self.net(orig_tensor)
 
-        # Convert tensors to numpy uint8 for YOLO inference (move to CPU if on GPU)
+        # convert tensors to numpy uint8 for YOLO inference
         def to_numpy(t):
             return (
                 t.squeeze(0)
@@ -173,50 +126,45 @@ class Evaluator:
             )
 
         orig_np = to_numpy(orig_tensor)
-        adv_np  = to_numpy(adv_tensor)
+        adv_np = to_numpy(adv_tensor)
 
-        orig_results = self.yolo(orig_np,  verbose=False)
-        adv_results  = self.yolo(adv_np,   verbose=False)
+        orig_results = self.yolo(orig_np, verbose=False)
+        adv_results = self.yolo(adv_np, verbose=False)
 
         orig_conf = _max_person_confidence(orig_results[0])
-        adv_conf  = _max_person_confidence(adv_results[0])
+        adv_conf = _max_person_confidence(adv_results[0])
 
         return {
-            "orig_has_person":  _has_person_detection(orig_results[0]),
-            "adv_has_person":   _has_person_detection(adv_results[0]),
-            "orig_conf":        orig_conf,
-            "adv_conf":         adv_conf,
-            "conf_drop":        orig_conf - adv_conf,
-            "psnr":             psnr(orig_tensor, adv_tensor),
-            "ssim":             ssim(orig_tensor, adv_tensor),
+            "orig_has_person": _has_person_detection(orig_results[0]),
+            "adv_has_person": _has_person_detection(adv_results[0]),
+            "orig_conf": orig_conf,
+            "adv_conf": adv_conf,
+            "conf_drop": orig_conf - adv_conf,
+            "psnr": psnr(orig_tensor, adv_tensor),
+            "ssim": ssim(orig_tensor, adv_tensor),
         }
-
-    # ------------------------------------------------------------------ #
 
     def run(self, steps: int | None = None) -> dict:
         """
-        Run evaluation over `steps` images (defaults to config.eval_steps).
-
-        Returns a summary dict and prints it to stdout.
+        Run evaluation over `steps` images.
         """
         n = steps or self.cfg.eval_steps
 
-        print(f"\n[evaluator] Processing {n} images from eval partition…\n")
+        print(f"\n[evaluator] Processing {n} images from eval partition...\n")
 
-        # Only count images where YOLO originally detects a person.
-        # (Attacking an image with no person is trivially successful.)
-        valid          = 0
-        suppressed     = 0
+        # only count images where YOLO originally detects a person
+        valid = 0
+        suppressed = 0
         total_conf_drop = 0.0
-        total_psnr     = 0.0
-        total_ssim     = 0.0
+        total_psnr = 0.0
+        total_ssim = 0.0
 
         for i in range(n):
             img = next(self.stream).to(self.device)
             m   = self._evaluate_single(img)
 
             if not m["orig_has_person"]:
-                continue  # skip — YOLO wouldn't fire anyway
+                continue
 
             valid += 1
 
@@ -224,8 +172,8 @@ class Evaluator:
                 suppressed += 1
 
             total_conf_drop += m["conf_drop"]
-            total_psnr      += m["psnr"]
-            total_ssim      += m["ssim"]
+            total_psnr += m["psnr"]
+            total_ssim += m["ssim"]
 
             if (i + 1) % 50 == 0:
                 print(f"  Processed {i+1}/{n} | valid so far: {valid}")
@@ -235,14 +183,14 @@ class Evaluator:
             return {}
 
         summary = {
-            "valid_images":        valid,
-            "suppression_rate":    suppressed / valid,
-            "mean_conf_drop":      total_conf_drop / valid,
-            "mean_psnr_db":        total_psnr / valid,
-            "mean_ssim":           total_ssim / valid,
+            "valid_images": valid,
+            "suppression_rate": suppressed / valid,
+            "mean_conf_drop": total_conf_drop / valid,
+            "mean_psnr_db": total_psnr / valid,
+            "mean_ssim": total_ssim / valid,
         }
 
-        # Format output message
+        # format output message
         output_lines = [
             "\n" + "=" * 50,
             "EVALUATION SUMMARY",
@@ -255,17 +203,17 @@ class Evaluator:
             "=" * 50 + "\n",
         ]
         
-        # Print to stdout
+        # print to stdout
         for line in output_lines:
             print(line)
         
-        # Save to file with timestamp
+        # save to file with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = self.cfg.sample_dir / f"eval_summary_{timestamp}.txt"
         with open(output_file, "w") as f:
             for line in output_lines:
                 f.write(line + "\n")
         
-        print(f"[evaluator] Results saved to → {output_file}")
+        print(f"[evaluator] Results saved to -> {output_file}")
 
         return summary
